@@ -1,4 +1,3 @@
-use testdb
 const user = db.users.findOne({ user_id: {{ .user_id }} });
 
   if (!user) {
