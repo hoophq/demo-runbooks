@@ -1,11 +1,11 @@
-⏺ const user = db.users.findOne({ user_id: {{ .user_id }} });
+⏺ const user = testdb.users.findOne({ user_id: {{ .user_id }} });
 
   if (!user) {
     print('Error: User not found');
     quit(1);
   }
 
-  const result = db.users.updateOne(
+  const result = testdb.users.updateOne(
     { user_id: {{ .user_id }} },
     {
       $set: {
