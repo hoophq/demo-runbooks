@@ -1,1 +1,2 @@
-testdb.users.find ({ user_id: {{ .user_id | type "number" }} })
+use testdb
+db.users.find ({ user_id: {{ .user_id | type "number" }} })
