@@ -1,1 +1,1 @@
-kubectl scale deployment {{ .deployment_name | type "select" | options "busybox" }} --replicas={{ .num_replicas | options "1" "2" "3" }}
+kubectl scale deployment {{ .deployment_name | type "select" | description "Select a pre-approved deployment" | options "busybox" }} --replicas={{ .num_replicas | options "1" "2" "3" }}
