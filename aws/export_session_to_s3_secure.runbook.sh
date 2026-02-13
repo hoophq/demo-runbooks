@@ -1,0 +1,156 @@
+#!/bin/bash
+# Export Hoop Session to S3 (Secure Version)
+# This runbook uses the asenv function to handle sensitive credentials securely
+#
+# Template Variables:
+# - session_id: The Hoop session ID to export
+# - s3_bucket: The target S3 bucket name
+# - s3_key_prefix: (optional) Prefix for the S3 object key
+# - export_format: Session export format (json, csv, txt)
+# - hoop_api_base_url: Hoop API base URL
+# - hoop_api_token: API token (exposed as env var via asenv)
+
+set -euo pipefail
+
+# Template variables - using asenv for sensitive data
+SESSION_ID="{{ .session_id | required "session_id is required" | description "The Hoop session ID to export" }}"
+S3_BUCKET="{{ .s3_bucket | required "s3_bucket is required" | description "Target S3 bucket name" | pattern "^[a-z0-9][a-z0-9.-]*[a-z0-9]$" }}"
+S3_KEY_PREFIX="{{ .s3_key_prefix | default "hoop-sessions" | description "S3 object key prefix (folder path)" }}"
+EXPORT_FORMAT="{{ .export_format | default "json" | description "Export format: json, csv, or txt" | pattern "^(json|csv|txt)$" }}"
+HOOP_API_BASE_URL="{{ .hoop_api_base_url | default "https://use.hoop.dev" | description "Hoop API base URL" }}"
+# Use asenv to expose API token as environment variable instead of command argument
+{{ .hoop_api_token | required "hoop_api_token is required" | description "Hoop API authentication token" | asenv "HOOP_API_TOKEN" }}
+
+# Derived variables
+TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
+TEMP_FILE="/tmp/hoop_session_${SESSION_ID}_${TIMESTAMP}.${EXPORT_FORMAT}"
+S3_KEY="${S3_KEY_PREFIX}/${SESSION_ID}_${TIMESTAMP}.${EXPORT_FORMAT}"
+
+echo "================================================"
+echo "Hoop Session Export to S3 (Secure)"
+echo "================================================"
+echo "Session ID: ${SESSION_ID}"
+echo "Export Format: ${EXPORT_FORMAT}"
+echo "Target Bucket: s3://${S3_BUCKET}/${S3_KEY}"
+echo "================================================"
+echo ""
+
+# Step 1: Get download URL from Hoop API
+echo "[1/4] Fetching session download URL from Hoop..."
+DOWNLOAD_RESPONSE=$(curl -s -w "\n%{http_code}" \
+  -H "Authorization: Bearer ${HOOP_API_TOKEN}" \
+  -H "Accept: application/json" \
+  "${HOOP_API_BASE_URL}/api/sessions/${SESSION_ID}?extension=${EXPORT_FORMAT}")
+
+# Extract HTTP status code
+HTTP_CODE=$(echo "$DOWNLOAD_RESPONSE" | tail -n1)
+RESPONSE_BODY=$(echo "$DOWNLOAD_RESPONSE" | sed '$d')
+
+if [ "$HTTP_CODE" != "200" ]; then
+  echo "Error: Failed to fetch session (HTTP ${HTTP_CODE})"
+  echo "Response: ${RESPONSE_BODY}"
+  exit 1
+fi
+
+# Extract download URL and expiration
+DOWNLOAD_URL=$(echo "$RESPONSE_BODY" | jq -r '.download_url // empty')
+EXPIRE_AT=$(echo "$RESPONSE_BODY" | jq -r '.expire_at // empty')
+
+if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+  echo "Error: No download URL in response"
+  echo "Response: ${RESPONSE_BODY}"
+  exit 1
+fi
+
+echo "✓ Download URL obtained"
+if [ -n "$EXPIRE_AT" ] && [ "$EXPIRE_AT" != "null" ]; then
+  echo "  URL expires at: ${EXPIRE_AT}"
+fi
+echo ""
+
+# Step 2: Download session data with progress indicator
+echo "[2/4] Downloading session data..."
+HTTP_CODE=$(curl -s -w "%{http_code}" -o "${TEMP_FILE}" \
+  -H "Authorization: Bearer ${HOOP_API_TOKEN}" \
+  "${DOWNLOAD_URL}")
+
+if [ "$HTTP_CODE" != "200" ]; then
+  echo "Error: Failed to download session (HTTP ${HTTP_CODE})"
+  rm -f "${TEMP_FILE}"
+  exit 1
+fi
+
+FILE_SIZE=$(wc -c < "${TEMP_FILE}" | tr -d ' ')
+FILE_SIZE_MB=$(echo "scale=2; ${FILE_SIZE}/1048576" | bc)
+echo "✓ Session downloaded (${FILE_SIZE} bytes / ${FILE_SIZE_MB} MB)"
+echo ""
+
+# Step 3: Verify AWS credentials and bucket access
+echo "[3/4] Verifying S3 bucket access..."
+
+# Get AWS identity for logging
+AWS_IDENTITY=$(aws sts get-caller-identity --query 'Arn' --output text 2>/dev/null || echo "unknown")
+echo "  AWS Identity: ${AWS_IDENTITY}"
+
+if ! aws s3 ls "s3://${S3_BUCKET}" >/dev/null 2>&1; then
+  echo "Error: Cannot access S3 bucket '${S3_BUCKET}'"
+  echo "Please verify:"
+  echo "  - AWS credentials are configured"
+  echo "  - The bucket exists"
+  echo "  - You have s3:ListBucket permission"
+  rm -f "${TEMP_FILE}"
+  exit 1
+fi
+echo "✓ S3 bucket accessible"
+echo ""
+
+# Step 4: Upload to S3 with metadata
+echo "[4/4] Uploading to S3..."
+
+# Calculate file checksum for integrity verification
+FILE_MD5=$(md5sum "${TEMP_FILE}" 2>/dev/null | awk '{print $1}' || md5 -q "${TEMP_FILE}" 2>/dev/null)
+
+if aws s3 cp "${TEMP_FILE}" "s3://${S3_BUCKET}/${S3_KEY}" \
+  --metadata "session-id=${SESSION_ID},export-timestamp=${TIMESTAMP},format=${EXPORT_FORMAT},md5=${FILE_MD5}" \
+  --content-type "application/${EXPORT_FORMAT}" \
+  --storage-class STANDARD; then
+
+  echo "✓ Upload successful"
+
+  # Verify upload by checking object existence
+  if aws s3api head-object --bucket "${S3_BUCKET}" --key "${S3_KEY}" >/dev/null 2>&1; then
+    echo "✓ Upload verified"
+  fi
+
+  echo ""
+  echo "================================================"
+  echo "Export Complete!"
+  echo "================================================"
+  echo "Session ID: ${SESSION_ID}"
+  echo "S3 Location: s3://${S3_BUCKET}/${S3_KEY}"
+  echo "File Size: ${FILE_SIZE} bytes (${FILE_SIZE_MB} MB)"
+  echo "Format: ${EXPORT_FORMAT}"
+  echo "MD5 Checksum: ${FILE_MD5}"
+  echo "Timestamp: ${TIMESTAMP}"
+  echo ""
+  echo "Download Command:"
+  echo "aws s3 cp s3://${S3_BUCKET}/${S3_KEY} ./"
+  echo ""
+  echo "View in AWS Console:"
+  echo "https://s3.console.aws.amazon.com/s3/object/${S3_BUCKET}?prefix=${S3_KEY}"
+  echo "================================================"
+else
+  echo "Error: Failed to upload to S3"
+  rm -f "${TEMP_FILE}"
+  exit 1
+fi
+
+# Cleanup with secure deletion
+echo ""
+echo "Cleaning up temporary files..."
+if command -v shred >/dev/null 2>&1; then
+  shred -u "${TEMP_FILE}" 2>/dev/null || rm -f "${TEMP_FILE}"
+else
+  rm -f "${TEMP_FILE}"
+fi
+echo "✓ Temporary file securely deleted"
